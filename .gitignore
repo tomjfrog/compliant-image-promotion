@@ -6,6 +6,8 @@
 # Node / Vite
 web/node_modules/
 web/dist/
+web/.npmrc
+**/.npmrc
 
 # Local env
 .env
@@ -14,3 +16,4 @@ web/dist/
 # JFrog CLI
 .jfrog/transfer/
 jfrog-cli-temp/
+

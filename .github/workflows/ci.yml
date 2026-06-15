@@ -102,8 +102,17 @@ jobs:
           test -n "${{ vars.JF_DOCKER_REGISTRY }}" || { echo "JF_DOCKER_REGISTRY is not set"; exit 1; }
           echo "IMAGE_TAG=${{ vars.JF_DOCKER_REGISTRY }}/${DOCKER_VIRTUAL_REPO}/${IMAGE_NAME}:${APP_VERSION}" >> "$GITHUB_ENV"
 
+      - name: Prepare npm credentials
+        run: |
+          test -n "${{ secrets.NPMRC_B64 }}" || { echo "NPMRC_B64 is not set"; exit 1; }
+          echo "${{ secrets.NPMRC_B64 }}" | base64 -d > /tmp/npmrc
+
       - name: Build Docker image
-        run: docker build --build-arg APP_VERSION="${APP_VERSION}" -t "${IMAGE_TAG}" .
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg APP_VERSION="${APP_VERSION}" \
+            --secret id=npmrc,src=/tmp/npmrc \
+            -t "${IMAGE_TAG}" .
 
       # jf docker push records build-info for the image and its layers.
       - name: Push image to Artifactory (with build-info)

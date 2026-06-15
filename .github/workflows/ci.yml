@@ -116,7 +116,7 @@ jobs:
 
       # jf docker push records build-info for the image and its layers.
       - name: Push image to Artifactory (with build-info)
-        run: jf docker push "${IMAGE_TAG}" --build-name="${BUILD_NAME}" --build-number="${BUILD_NUMBER}"
+        run: jf docker push "${IMAGE_TAG}" --build-name="${BUILD_NAME}" --build-number="${BUILD_NUMBER}" --project="${JF_PROJECT}"
 
       - name: Capture image digest
         id: digest
@@ -131,11 +131,11 @@ jobs:
 
       - name: Collect build environment + git metadata
         run: |
-          jf rt build-collect-env "${BUILD_NAME}" "${BUILD_NUMBER}"
-          jf rt build-add-git "${BUILD_NAME}" "${BUILD_NUMBER}"
+          jf rt build-collect-env "${BUILD_NAME}" "${BUILD_NUMBER}" --project="${JF_PROJECT}"
+          jf rt build-add-git "${BUILD_NAME}" "${BUILD_NUMBER}" --project="${JF_PROJECT}"
 
       - name: Publish build-info
-        run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
+        run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}" --project="${JF_PROJECT}"
 
       # Full Xray scan of the published build graph.
       - name: "Xray: scan published build"
@@ -188,7 +188,7 @@ jobs:
       - name: Create application version from build
         run: |
           jf apptrust version-create "${APP_KEY}" "${APP_VERSION}" \
-            --source-type-builds="name=${BUILD_NAME}, id=${BUILD_NUMBER}" \
+            --source-type-builds="name=${BUILD_NAME}, id=${BUILD_NUMBER}, repo-key=${JF_PROJECT}-build-info" \
             --tag="release-candidate"
 
       - name: Promote to DEV

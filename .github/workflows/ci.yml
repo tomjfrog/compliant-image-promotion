@@ -171,10 +171,17 @@ jobs:
 
       - name: Ensure AppTrust application exists
         run: |
-          if jf apptrust app-create "${APP_KEY}" --spec=.jfrog/application-spec.json; then
+          set +e
+          output=$(jf apptrust app-create "${APP_KEY}" --spec=.jfrog/application-spec.json 2>&1)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
             echo "Application created."
+          elif echo "$output" | grep -qi 'already exists'; then
+            echo "Application already exists; continuing."
           else
-            echo "Application likely exists; continuing."
+            echo "$output" >&2
+            exit "$status"
           fi
 
       # Bundle the published build into an immutable AppTrust application version.

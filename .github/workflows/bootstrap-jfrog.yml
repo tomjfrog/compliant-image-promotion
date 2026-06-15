@@ -81,8 +81,15 @@ jobs:
 
       - name: Create AppTrust Application (if absent)
         run: |
-          if jf apptrust app-create "$APP_KEY" --spec=.jfrog/application-spec.json; then
+          set +e
+          output=$(jf apptrust app-create "$APP_KEY" --spec=.jfrog/application-spec.json 2>&1)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
             echo "Application '$APP_KEY' created."
+          elif echo "$output" | grep -qi 'already exists'; then
+            echo "Application '$APP_KEY' already exists; continuing."
           else
-            echo "Application '$APP_KEY' likely already exists; continuing."
+            echo "$output" >&2
+            exit "$status"
           fi

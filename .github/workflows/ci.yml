@@ -62,7 +62,7 @@ jobs:
           jf audit $AUDIT_ARGS > xray-results/audit.sarif
 
       - name: Upload SARIF to GitHub code scanning
-        if: always()
+        if: false # TODO: Uncomment this when we sort out the issue
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: xray-results/audit.sarif

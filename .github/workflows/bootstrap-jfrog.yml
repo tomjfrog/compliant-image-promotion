@@ -1,0 +1,88 @@
+name: "Bootstrap JFrog (repos + AppTrust app)"
+
+# One-time setup. Provisions the stage-mapped Artifactory repositories used by
+# the demo and registers the AppTrust Application. Safe to re-run: every step
+# tolerates "already exists" responses.
+#
+# Repository topology (per package type: docker / go / npm):
+#   <type>-remote       -> proxies the upstream registry            (env: DEV)
+#   <type>-dev-local    -> artifacts at the DEV stage               (env: DEV)
+#   <type>-np-local     -> artifacts at the NP stage                (env: uhgcomp-NP)
+#   <type>-prod-local   -> artifacts at the PROD stage              (env: PROD)
+#   <type>              -> virtual aggregating all locals + remote  (env: DEV)
+#
+# NOTE: the NP stage is a *custom project environment*. Custom project
+# environments are key-prefixed, so it is referenced as "uhgcomp-NP".
+# Create it once under Administration -> Projects -> uhgcomp -> Environments
+# before running this workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  JF_PROJECT: uhgcomp
+  APP_KEY: claims-processor-application
+  NP_ENV: uhgcomp-NP
+
+jobs:
+  bootstrap:
+    name: "Create repositories and AppTrust application"
+    runs-on: ubuntu-latest
+    env:
+      JF_URL: ${{ vars.JF_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+        with:
+          oidc-provider-name: ${{ secrets.OIDC_PROVIDER_NAME }}
+          oidc-audience: ${{ secrets.OIDC_AUDIENCE }}
+
+      - name: Create stage-mapped repositories
+        run: |
+          create_repo() {
+            local key="$1"; local body="$2"
+            echo "Creating repository: $key"
+            jf rt curl -s -XPUT "/api/repositories/${key}" \
+              -H "Content-Type: application/json" -d "$body" || true
+            echo
+          }
+
+          # Upstream proxies (resolution entry point -> DEV)
+          create_repo "uhgcomp-docker-remote" \
+            '{"rclass":"remote","packageType":"docker","url":"https://registry-1.docker.io","projectKey":"uhgcomp","environments":["DEV"],"xrayIndex":true}'
+          create_repo "uhgcomp-go-remote" \
+            '{"rclass":"remote","packageType":"go","url":"https://proxy.golang.org","projectKey":"uhgcomp","environments":["DEV"],"xrayIndex":true}'
+          create_repo "uhgcomp-npm-remote" \
+            '{"rclass":"remote","packageType":"npm","url":"https://registry.npmjs.org","projectKey":"uhgcomp","environments":["DEV"],"xrayIndex":true}'
+
+          # Per-stage local repositories
+          for type in docker go npm; do
+            create_repo "uhgcomp-${type}-dev-local" \
+              "{\"rclass\":\"local\",\"packageType\":\"${type}\",\"projectKey\":\"uhgcomp\",\"environments\":[\"DEV\"]}"
+            create_repo "uhgcomp-${type}-np-local" \
+              "{\"rclass\":\"local\",\"packageType\":\"${type}\",\"projectKey\":\"uhgcomp\",\"environments\":[\"${NP_ENV}\"]}"
+            create_repo "uhgcomp-${type}-prod-local" \
+              "{\"rclass\":\"local\",\"packageType\":\"${type}\",\"projectKey\":\"uhgcomp\",\"environments\":[\"PROD\"]}"
+          done
+
+          # Virtual repositories (single resolve/deploy endpoint per type)
+          for type in docker go npm; do
+            create_repo "uhgcomp-${type}" \
+              "{\"rclass\":\"virtual\",\"packageType\":\"${type}\",\"projectKey\":\"uhgcomp\",\"environments\":[\"DEV\"],\"repositories\":[\"uhgcomp-${type}-dev-local\",\"uhgcomp-${type}-np-local\",\"uhgcomp-${type}-prod-local\",\"uhgcomp-${type}-remote\"],\"defaultDeploymentRepo\":\"uhgcomp-${type}-dev-local\"}"
+          done
+
+      - name: Create AppTrust Application (if absent)
+        run: |
+          if jf apptrust app-create "$APP_KEY" --spec=.jfrog/application-spec.json; then
+            echo "Application '$APP_KEY' created."
+          else
+            echo "Application '$APP_KEY' likely already exists; continuing."
+          fi

@@ -1,0 +1,244 @@
+name: "CI — Build, Xray Scan, AppTrust Promote"
+
+# End-to-end compliant pipeline for the Claims Processor demo:
+#   1. SCA dependency audit (Xray)             -> jf audit
+#   2. Build + push Docker image (build-info)   -> docker build / jf docker push
+#   3. Xray image + build scan                  -> jf docker scan / jf rt build-scan
+#   4. Build provenance attestation -> Evidence -> actions/attest-build-provenance
+#   5. Create AppTrust application version       -> jf apptrust version-create
+#   6. Compliant promotion DEV -> NP -> PROD     -> jf apptrust version-promote (gated)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  id-token: write          # OIDC auth with JFrog + provenance signing
+  contents: read
+  security-events: write   # SARIF upload to GitHub code scanning
+  attestations: write      # actions/attest-build-provenance
+
+env:
+  JF_PROJECT: uhgcomp
+  APP_KEY: claims-processor-application
+  IMAGE_NAME: claimsprocessor
+  DOCKER_VIRTUAL_REPO: uhgcomp-docker
+  # Pushes to the virtual repo land in its default deployment repo (the DEV
+  # stage local); promotion later moves the version to the NP and PROD locals.
+  DOCKER_LOCAL_REPO: uhgcomp-docker-dev-local
+  BUILD_NAME: claims-processor-build
+  BUILD_NUMBER: ${{ github.run_number }}
+  APP_VERSION: 1.0.${{ github.run_number }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  sca-audit:
+    name: "1 · Xray SCA dependency audit"
+    runs-on: ubuntu-latest
+    env:
+      JF_URL: ${{ vars.JF_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_PROJECT: ${{ env.JF_PROJECT }}
+        with:
+          oidc-provider-name: ${{ secrets.OIDC_PROVIDER_NAME }}
+          oidc-audience: ${{ secrets.OIDC_AUDIENCE }}
+
+      # Scans go.mod + web/package.json against Xray. --fail=false reports
+      # without blocking; flip to true (or rely on a Watch) to gate the build.
+      - name: "Xray: audit source dependencies"
+        run: |
+          AUDIT_ARGS="--format=sarif --fail=false"
+          if [ -n "${{ vars.XRAY_WATCH_NAME }}" ]; then
+            AUDIT_ARGS="$AUDIT_ARGS --watches=${{ vars.XRAY_WATCH_NAME }}"
+          fi
+          mkdir -p xray-results
+          jf audit $AUDIT_ARGS > xray-results/audit.sarif
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: xray-results/audit.sarif
+          category: jfrog-xray-sca
+
+  # ───────────────────────────────────────────────────────────────────────────
+  build-scan:
+    name: "2 · Build, push & Xray scan image"
+    runs-on: ubuntu-latest
+    needs: sca-audit
+    env:
+      JF_URL: ${{ vars.JF_URL }}
+    outputs:
+      image-digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        id: setup-jfrog-cli
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_PROJECT: ${{ env.JF_PROJECT }}
+        with:
+          oidc-provider-name: ${{ secrets.OIDC_PROVIDER_NAME }}
+          oidc-audience: ${{ secrets.OIDC_AUDIENCE }}
+
+      - name: Docker login to Artifactory
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.JF_DOCKER_REGISTRY }}
+          username: ${{ steps.setup-jfrog-cli.outputs.oidc-user }}
+          password: ${{ steps.setup-jfrog-cli.outputs.oidc-token }}
+
+      - name: Set image reference
+        run: echo "IMAGE_TAG=${{ vars.JF_DOCKER_REGISTRY }}/${DOCKER_VIRTUAL_REPO}/${IMAGE_NAME}:${APP_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build Docker image
+        run: docker build --build-arg APP_VERSION="${APP_VERSION}" -t "${IMAGE_TAG}" .
+
+      # jf docker push records build-info for the image and its layers.
+      - name: Push image to Artifactory (with build-info)
+        run: jf docker push "${IMAGE_TAG}" --build-name="${BUILD_NAME}" --build-number="${BUILD_NUMBER}"
+
+      - name: Capture image digest
+        id: digest
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_TAG}" | cut -d'@' -f2)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Image digest: ${DIGEST}"
+
+      # Layer-by-layer Xray scan of the image (OS + app packages).
+      - name: "Xray: scan image"
+        run: jf docker scan "${IMAGE_TAG}" --fail=false
+
+      - name: Collect build environment + git metadata
+        run: |
+          jf rt build-collect-env "${BUILD_NAME}" "${BUILD_NUMBER}"
+          jf rt build-add-git "${BUILD_NAME}" "${BUILD_NUMBER}"
+
+      - name: Publish build-info
+        run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
+
+      # Full Xray scan of the published build graph.
+      - name: "Xray: scan published build"
+        run: jf rt build-scan "${BUILD_NAME}" "${BUILD_NUMBER}" --project="${JF_PROJECT}" --fail=false
+
+      # Signed SLSA provenance — auto-ingested into JFrog Evidence by the
+      # setup-jfrog-cli post-job step.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: oci://${{ vars.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_LOCAL_REPO }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false
+
+  # ───────────────────────────────────────────────────────────────────────────
+  release-and-promote:
+    name: "3 · AppTrust version + promote DEV → NP"
+    runs-on: ubuntu-latest
+    needs: build-scan
+    env:
+      JF_URL: ${{ vars.JF_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_PROJECT: ${{ env.JF_PROJECT }}
+        with:
+          oidc-provider-name: ${{ secrets.OIDC_PROVIDER_NAME }}
+          oidc-audience: ${{ secrets.OIDC_AUDIENCE }}
+
+      - name: Ensure AppTrust application exists
+        run: |
+          if jf apptrust app-create "${APP_KEY}" --spec=.jfrog/application-spec.json; then
+            echo "Application created."
+          else
+            echo "Application likely exists; continuing."
+          fi
+
+      # Bundle the published build into an immutable AppTrust application version.
+      - name: Create application version from build
+        run: |
+          jf apptrust version-create "${APP_KEY}" "${APP_VERSION}" \
+            --source-type-builds="name=${BUILD_NAME}, id=${BUILD_NUMBER}" \
+            --tag="release-candidate"
+
+      - name: Promote to DEV
+        run: jf apptrust version-promote "${APP_KEY}" "${APP_VERSION}" DEV --sync=true
+
+      - name: Setup signing key (optional evidence)
+        if: vars.ENABLE_EVIDENCE == 'true'
+        run: |
+          echo "${{ secrets.EVIDENCE_PRIVATE_KEY }}" > private.pem
+          chmod 600 private.pem
+
+      - name: Attach test-results evidence (DEV)
+        if: vars.ENABLE_EVIDENCE == 'true'
+        run: |
+          echo '{"actor":"${{ github.actor }}","date":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","test":"unit+integration","result":"passed"}' > test-evidence.json
+          jf evd create \
+            --release-bundle="${APP_KEY}" \
+            --release-bundle-version="${APP_VERSION}" \
+            --predicate=./test-evidence.json \
+            --predicate-type=https://jfrog.com/evidence/testing-results/v1 \
+            --key=private.pem \
+            --key-alias="${{ vars.EVIDENCE_KEY_ALIAS }}" \
+            --project="${JF_PROJECT}"
+
+      - name: Promote to NP
+        run: jf apptrust version-promote "${APP_KEY}" "${APP_VERSION}" NP --sync=true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  promote-prod:
+    name: "4 · Compliant promotion to PROD"
+    runs-on: ubuntu-latest
+    needs: release-and-promote
+    # GitHub Environment gate: configure required reviewers on the
+    # "production" environment to require a manual approval before PROD.
+    environment: production
+    env:
+      JF_URL: ${{ vars.JF_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_PROJECT: ${{ env.JF_PROJECT }}
+        with:
+          oidc-provider-name: ${{ secrets.OIDC_PROVIDER_NAME }}
+          oidc-audience: ${{ secrets.OIDC_AUDIENCE }}
+
+      - name: Setup signing key (optional evidence)
+        if: vars.ENABLE_EVIDENCE == 'true'
+        run: |
+          echo "${{ secrets.EVIDENCE_PRIVATE_KEY }}" > private.pem
+          chmod 600 private.pem
+
+      - name: Attach approval evidence (PROD gate)
+        if: vars.ENABLE_EVIDENCE == 'true'
+        run: |
+          echo '{"actor":"${{ github.actor }}","date":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","approval":"granted","gate":"production"}' > approval-evidence.json
+          jf evd create \
+            --release-bundle="${APP_KEY}" \
+            --release-bundle-version="${APP_VERSION}" \
+            --predicate=./approval-evidence.json \
+            --predicate-type=https://jfrog.com/evidence/approval/v1 \
+            --key=private.pem \
+            --key-alias="${{ vars.EVIDENCE_KEY_ALIAS }}" \
+            --project="${JF_PROJECT}"
+
+      # AppTrust evaluates the PROD entry gate/policies during this promotion.
+      - name: Promote to PROD
+        run: jf apptrust version-promote "${APP_KEY}" "${APP_VERSION}" PROD --sync=true

@@ -1,0 +1,16 @@
+# Go
+/claimsprocessor
+*.test
+*.out
+
+# Node / Vite
+web/node_modules/
+web/dist/
+
+# Local env
+.env
+*.local
+
+# JFrog CLI
+.jfrog/transfer/
+jfrog-cli-temp/

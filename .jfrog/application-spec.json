@@ -1,0 +1,11 @@
+{
+  "project_key": "uhgcomp",
+  "application_name": "Claims Processor",
+  "description": "Hello-world claims processor demo showcasing JFrog Xray dependency scanning and AppTrust compliant promotion (DEV -> NP -> PROD).",
+  "maturity_level": "experimental",
+  "criticality": "medium",
+  "labels": [
+    { "key": "team", "value": "claims" },
+    { "key": "demo", "value": "xray-apptrust" }
+  ]
+}

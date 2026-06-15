@@ -3,7 +3,7 @@
 # ---------- Stage 1: build the front-end (Vite) ----------
 FROM node:20-alpine AS frontend
 WORKDIR /app/web
-COPY web/package.json web/package-lock.json* ./
+COPY web/package.json web/npm-shrinkwrap.json ./
 RUN --mount=type=secret,id=npmrc,target=/app/web/.npmrc npm ci
 COPY web/ ./
 RUN npm run build
